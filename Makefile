@@ -1,21 +1,21 @@
 BOLD    = \033[1m
 RESET   = \033[0m
 
-# ── text colors ───────────────────────────────────────────
+# text colors
 BLACK   = \033[30m
 GREEN   = \033[32m
 YELLOW  = \033[33m
 CYAN    = \033[36m
 WHITE   = \033[37m
 
-# ── background colors ─────────────────────────────────────
+# background colors
 BG_BLACK   = \033[40m
 BG_GREEN   = \033[42m
 BG_YELLOW  = \033[43m
 BG_CYAN    = \033[46m
 BG_DEFAULT = \033[49m
 
-# ── symbols ───────────────────────────────────────────────
+# symbols
 ARROW  = →
 OK     = ✔
 FAIL   = ✘
@@ -62,11 +62,11 @@ lint:
 
 	@echo "$(BG_YELLOW)$(BLACK)$(BOLD)  flake8  $(RESET)  $(YELLOW)$(ARROW) checking style...$(RESET)"
 	@sleep 0.3
-	@flake8 src && echo "  $(GREEN)$(OK) flake8 passed$(RESET)" || (echo "  $(FAIL) flake8 failed$(RESET)"; exit 1)
+	@uv tool run flake8 src && echo "  $(GREEN)$(OK) flake8 passed$(RESET)" || (echo "  $(FAIL) flake8 failed$(RESET)"; exit 1)
 	@echo ""
 
 	@echo "$(BG_CYAN)$(BLACK)$(BOLD)  mypy    $(RESET)  $(CYAN)$(ARROW) checking types...$(RESET)"
-	@mypy . --warn-return-any        \
+	@uv tool run mypy . --warn-return-any        \
 	         --warn-unused-ignores   \
 	         --ignore-missing-imports \
 	         --disallow-untyped-defs \
