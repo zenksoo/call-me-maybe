@@ -1,59 +1,99 @@
 from llm_sdk import Small_LLM_Model
-from pathlib import Path
 from .JsonValidator import TestCaseSchema, FunctionDefSchema
-from typing import Dict, List, Any, Callable
-from json.decoder import JSONDecodeError
-from pydantic import ValidationError
-import json
-from sys import stderr
-import sys
+import numpy as np
 import argparse
-from functools import singledispatch
-from .Colors import *
+import sys
+from typing import Dict, List, Any
+from pathlib import Path
+from sys import stderr
+import time
+import json
+import re
+from .rendering import *
 
 
-def get_error_handler() -> Callable[[BaseException], None]:
-    @singledispatch
-    def _handle_by_type(error_type: BaseException) -> None:
-        print(f"{BG_BLUE} {RESET} {error_type}")
+def parse_functions_definitions(funcs: List[FunctionDefSchema]) -> List[Dict[str, Any]]:
+    TOOLS: List[Dict[str, Any]] = []
+    for f in funcs:
+        TOOLS.append(
+            {
+                "name": f.name,
+                "description": f.description,
+                "parameters": f.parameters,
+                "returns": f.returns
+            },
+        )
+    return TOOLS
 
-    @_handle_by_type.register(ValidationError)
-    def _(exc: ValidationError) -> None:
-        for error in exc.errors():
-            if error["type"] == "missing":
-                print(f"{BG_BLUE} {RESET} Missing",
-                      f"Required Field: {', '.join([e for e in error["loc"]])}")
-            else:
-                print(f"{BG_BLUE} {RESET} {error["msg"]}")
+def build_prompt(user_request: str, tools: List[Dict[str, Any]]) -> str:
+    tools_json = json.dumps(tools, indent=2)
+    return f"""You are a function-calling assistant. Given a user request, pick the best function and return ONLY a JSON object — no explanation, no markdown, no extra text.
 
-    @_handle_by_type.register(JSONDecodeError)
-    def _(exc: JSONDecodeError) -> None:
-        print(f"{BG_BLUE} {RESET} Invalid Formate For JSON File: {exc}\n", file=stderr)
+            Available functions:
+            {tools_json}
 
-    @_handle_by_type.register(PermissionError)
-    def _(exc: PermissionError) -> None:
-        print(f"{BG_BLUE} {RESET} Permission Denied: {exc.filename}")
+            Output format (strictly):
+            {{"function": "<function_name>", "parameters": {{<key>: <value>, ...}}}}
 
-    @_handle_by_type.register(FileNotFoundError)
-    def _(exc: FileNotFoundError) -> None:
-        print(f"{BG_BLUE} {RESET} File not found: {exc.filename}")
-
-    def render_exception(error: BaseException) -> None:
-        print(f"\n{BG_RED}{FG_BLACK}   Program Failed !!   {RESET}", file=stderr, end="")
-        print(f"{BG_YELLOW}{FG_BLACK} Error Type: {error.__class__.__name__} {RESET}")
-        _handle_by_type(error)
-        print()
-
-    return render_exception
+            User request: {user_request}
+            Response:
+        """
 
 
-def encode_functions_name(funcs: List[FunctionDefSchema], llm_model: Small_LLM_Model) -> Dict[str, List[int]]:
+def generate(model: Small_LLM_Model, prompt: str, max_new_tokens: int = 200) -> str:
+    # Encode prompt → list of ints
+    input_ids = model._tokenizer.encode(prompt, add_special_tokens=False)
+    eos_id = model._tokenizer.eos_token_id
 
-    result: Dict[str, List[int]] = {}
-    for func in funcs:
-        result[func.name] = llm_model.encode(func.name).tolist()[0]
-    return result
+    generated = []
+    for i in range(max_new_tokens):
+        logits = model.get_logits_from_input_ids(input_ids)
 
+        # pick the token with the highest logit
+        next_token = int(np.argmax(logits))
+
+        if next_token == eos_id:
+            break
+
+        input_ids.append(next_token)
+        generated.append(next_token)
+
+        # # Stop early if we see a closing brace → JSON is done
+        partial = model._tokenizer.decode(generated, skip_special_tokens=True)
+        if partial.count('{') > 0 and partial.count('}') >= partial.count('{'):
+            break
+        render_progress_bar(i)
+    sys.stdout.write("\033[?25h\r\033[K")
+
+    return model._tokenizer.decode(generated, skip_special_tokens=True)
+
+
+def parse_tool_call(raw: str) -> dict:
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if not match:
+        raise ValueError(f"No JSON found in model output:\n{raw}")
+    return json.loads(match.group())
+
+
+def run(model: Small_LLM_Model, user_request: str,
+        output_res: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]]) -> bool:
+    prompt   = build_prompt(user_request, tools)
+    raw      = generate(model, prompt)
+    time.sleep(0.05)
+
+    call     = parse_tool_call(raw)
+    fn_name  = call["function"]
+    params   = call["parameters"]
+
+    output_res.append(
+        {
+            "prompt": user_request,
+            "name": fn_name,
+            "parameters": params
+        }
+    )
+    return True
 
 
 def main(args: argparse.Namespace) -> None:
@@ -64,6 +104,8 @@ def main(args: argparse.Namespace) -> None:
         args.input_file = "function_calling_tests.json"
     if not args.output_file:
         args.output_file = "function_calling_results.json"
+
+    output_path = Path("data/output")
 
     prompts: List[str] = []
     with open(f"data/input/{args.input_file}", 'r') as f:
@@ -79,62 +121,58 @@ def main(args: argparse.Namespace) -> None:
             valid = FunctionDefSchema(**funcdef)
             func_definition.append(valid)
 
+    TOOLS = parse_functions_definitions(func_definition)
+
     llm_model = Small_LLM_Model()
 
-    encoded_function_name = encode_functions_name(func_definition, llm_model)
-    print(encoded_function_name)
+    output_res = []
+    passed_prompt = []
+    for p, i in zip(prompts, range(1, len(prompts) + 1)):
+        try:
+            sys.stdout.write("\033[2J\033[H\033[?25l")
+            sys.stdout.flush()
+            render_prompts_stat(i, prompts, passed_prompt)
 
-    # tt: List[Dict[str, Any]] = []
-    # i = 0
-    # dic: Dict[str, Any] = {}
-    # for func in func_definition:
-    #     dic["name"] = func.name
-    #     dic["parameters"] = func.parameters
-    #     tt.append(dic)
+            start = time.perf_counter()
+            print(f"\n{BG_BLUE} {RESET}{BG_CYAN}{FG_BLACK} Prompt {RESET} {p}")
+            try:
+                res = run(llm_model, p, output_res, TOOLS)
+            except KeyboardInterrupt:
+                res = False
+            passed_prompt.append(res)
+            end = time.perf_counter()
+            duration_minutes = (end - start) / 60
+            time.sleep(0.08)
+        except KeyboardInterrupt:
+            pass
 
+    sys.stdout.write("\033[2J\033[H\033[?25l")
+    sys.stdout.flush()
+    render_prompts_stat(len(prompts) + 1, prompts, passed_prompt)
 
-    # for prompt in prompts:
-    # mprompt = f"question: {prompts[0]}, function: fn_substitute_string_with_regex. this function solve the question ? "
-
-    # msg = f"prompt is : {prompt}, all functions : "
-    # msg += f"{[f.name for f in func_definition]}, what does the functino name that i use to solve what prompt tell me to do ? "
-    # encoded = llm_model.encode(mprompt).tolist()[0]
-    # # print(encoded)
-    # while True:
-    #     tokens = llm_model.get_logits_from_input_ids(encoded)
-    #     new_token = tokens.index(max(tokens))
-    #     encoded.append(new_token)
-    #     print(llm_model.decode([new_token]), end="")
-
-
-    # string = prompts[0]
-    # encoded = llm_model.encode(string).tolist()
-    # encoded = encoded[0]
-    # while True:
-    #     tokens = llm_model.get_logits_from_input_ids(encoded)
-    #     new_token = tokens.index(max(tokens))
-    #     encoded.append(new_token)
-    #     print(llm_model.decode([new_token]), end="")
-    # except  as e:
-    #     sys.exit(1)
-    # except ValidationError as e:
-    #     print(f"Invalid Data: {e.errors()[0]["msg"]}", file=stderr)
-    #     sys.exit(1)
+    if any(passed_prompt):
+        output_path.mkdir(parents=True, exist_ok=True)
+        with open(f"data/output/{args.output_file}", 'w') as f:
+            json.dump(output_res, f, indent=4)
+        print(f"\n\n{BG_GREEN} {RESET} {FG_GREEN}Passed Prompts Are Seccessfully Saved{RESET}")
+        print(f"{BG_GREEN} {RESET} PATH: /data/ouput/{args.output_file}")
+        sys.stdout.write("\033[?25h")
+    else:
+        print(f"\n\n{BG_RED} {RESET}{FG_RED}",
+              f"All Prompts Failed Nothing to save{RESET}")
 
 
 if __name__ == "__main__":
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-f', '--functions_definition')
-    parser.add_argument('-i', '--input_file')
-    parser.add_argument('-o', '--output_file')
-    args = parser.parse_args()
-
     render_exception = get_error_handler()
-
     try:
+        parser = argparse.ArgumentParser()
+        parser.add_argument('-f', '--functions_definition')
+        parser.add_argument('-i', '--input_file')
+        parser.add_argument('-o', '--output_file')
+        args = parser.parse_args()
+
         main(args)
-    except BaseException as e:
+    except (BaseException, KeyboardInterrupt) as e:
         render_exception(e)
         sys.exit(1)
     sys.exit(0)

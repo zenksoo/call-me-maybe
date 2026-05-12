@@ -20,17 +20,19 @@ BG_DEFAULT = \033[49m
 ARROW  = →
 OK     = ✔
 FAIL   = ✘
-SEP    = ════════════════════════════════
 
 PYCACHE_FILES = $$(find . -type d -name "__pycache__")
 MYPY_CACHES = $$(find . -type d -name ".mypy_cache")
 
 
 install:
-	@uv sync
-
+	@echo ""
+	@echo "      $(BG_YELLOW)$(BLACK)   Install Dependencies ...   $(RESET)"
+	@uv sync && \
+			echo "\n$(BG_GREEN)$(BLACK)  All Dependencies Successfully Installed  $(RESET)" || \
+			echo "\n$(BG_RED) $(RESET)  $(RED)$(FAIL) Installation Failed $(RESET)"
 run:
-	@uv run python3 -m src; exit $$?
+	@uv run python3 -m src
 
 debug:
 	@uv run -m pdb -m src.main
@@ -40,10 +42,14 @@ clean:
 	@echo "$(BG_YELLOW)$(BLACK)         🧹 CLEAN         $(RESET)"
 
 	@sleep 0.3
-	@rm -rf $(PYCACHE_FILES) && echo "  $(GREEN)$(OK) pycache removed$(RESET)" || (echo "  $(FAIL) nothing to remove$(RESET)"; exit 0)
+	@rm -rf $(PYCACHE_FILES) && \
+		echo "  $(GREEN)$(OK) pycache removed$(RESET)" || \
+		(echo "  $(FAIL) nothing to remove$(RESET)"; exit 0)
 
 	@sleep 0.3
-	@rm -rf $(MYPY_CACHES) && echo "  $(GREEN)$(OK) mypy_cache removed$(RESET)" || (echo "  $(FAIL) nothing to remove$(RESET)"; exit 0)
+	@rm -rf $(MYPY_CACHES) && \
+		echo "  $(GREEN)$(OK) mypy_cache removed$(RESET)" || \
+		(echo "  $(FAIL) nothing to remove$(RESET)"; exit 0)
 	@echo ""
 	@echo "$(BG_GREEN)$(BLACK)   $(OK) workspace is clean   $(RESET)"
 	@echo ""
@@ -55,7 +61,7 @@ lint:
 
 	@echo "$(BG_YELLOW)$(BLACK)  flake8  $(RESET)  $(YELLOW)$(ARROW) checking style...$(RESET)"
 	@sleep 0.3
-	@uv tool run flake8 src/Colors.py && \
+	@uv tool run flake8 . && \
 			echo "$(BG_GREEN) $(RESET)  $(GREEN)$(OK) flake8 passed$(RESET)" || \
 			(echo "$(BG_RED) $(RESET) $(RED)$(FAIL) flake8 failed$(RESET)"; exit 1)
 	@echo ""
