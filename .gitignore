@@ -9,3 +9,5 @@ data/output
 
 # Virtual environments
 .venv
+output
+main.py

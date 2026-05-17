@@ -78,19 +78,14 @@ def get_error_handler() -> Callable[[BaseException], None]:
 
 def render_progress_bar(i: int, items: int = 200,
                         bar_length: int = 50) -> None:
-    # Hide cursor
     sys.stdout.write("\033[?25l")
 
     percent = (i / items) * 100
 
-    # 2. Calculate how many "blocks" to fill based on bar_length
     filled_length = int(bar_length * i // items)
 
-    # 3. Construct the bar string
     bar = '█' * filled_length + '░' * (bar_length - filled_length)
 
-    # 4. Atomic write: \r moves to start, \033[K clears any old residue
-    # We format the percent to 1 decimal place to keep the width steady
     output = f"\r|{bar}| {percent:>5.1f}% ({i}/{items})"
 
     sys.stdout.write(output + "\033[K")

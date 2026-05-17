@@ -1,195 +1,211 @@
+from .rendering import get_error_handler
+from .JsonValidator import TestCaseSchema, FunctionDefSchema
+from pydantic import BaseModel, Field, ValidationError
+from typing import List, Dict, Any, Callable
+from pathlib import Path
 from llm_sdk import Small_LLM_Model
-from src.JsonValidator import TestCaseSchema, FunctionDefSchema
 import numpy as np
 import argparse
-import sys
-from typing import Dict, List, Any
-from pathlib import Path
-import time
 import json
+import sys
 import re
-from src.rendering import get_error_handler, render_progress_bar
-from src.rendering import render_prompts_stat
 
 
-RESET = "\033[0m"
+class Config(BaseModel):
+    prompts: List[str] = []
+    tools: List[dict[str, Any]] = []
+    output_path: str
 
-# Foreground colors
-FG_BLACK = "\033[30m"
-FG_RED = "\033[31m"
-FG_GREEN = "\033[32m"
+    @classmethod
+    def load(cls) -> "Config":
 
-# Background colors
-BG_RED = "\033[41m"
-BG_GREEN = "\033[42m"
-BG_BLUE = "\033[44m"
-BG_CYAN = "\033[46m"
+        def get_prompts(input_path: str) -> List[str]:
+            prompts: List[str] = []
+            with open(input_path, 'r') as f:
+                content = json.load(f)
+                for prompt in content:
+                    prompts.append(TestCaseSchema(**prompt).prompt)
+            return prompts
 
+        def get_functions_defschema(fndef_path: str) -> List[Dict[str, Any]]:
+            fncs_definition: List[Dict[str, Any]] = []
+            with open(fndef_path, 'r') as f:
+                content = json.load(f)
+                for fndef in content:
+                    fndef_schema = FunctionDefSchema(**fndef)
+                    fncs_definition.append({
+                            "name": fndef_schema.name,
+                            "description": fndef_schema.description,
+                            "parameters": fndef_schema.parameters,
+                            "returns": fndef_schema.returns
+                        }
+                    )
+            return fncs_definition
 
-def parse_functions_definitions(funcs: List[FunctionDefSchema]
-                                ) -> List[Dict[str, Any]]:
-    TOOLS: List[Dict[str, Any]] = []
-    for f in funcs:
-        TOOLS.append(
-            {
-                "name": f.name,
-                "description": f.description,
-                "parameters": f.parameters,
-                "returns": f.returns
-            },
-        )
-    return TOOLS
+        agparser = argparse.ArgumentParser()
+        agparser.add_argument('-f', '--functions_definition',
+                            help="Path to JSON file that contain functions definition",)
+        agparser.add_argument('-i', '--input',
+                            help="Path to JSON file that contains prompts that \
+                                you want the LLM to process")
+        agparser.add_argument('-o', '--output',
+                            help="Where you want to save the LLM output")
+        args = agparser.parse_args()
+        if not args.functions_definition:
+            args.functions_definition = "data/input/functions_definition.json"
+        if not args.input:
+            args.input = "data/input/function_calling_tests.json"
+        if not args.output:
+            args.output = "output/function_calling_results.json"
 
+        return Config(prompts=get_prompts(args.input),
+                      tools=get_functions_defschema(args.functions_definition),
+                      output_path=args.output)
 
-def build_prompt(user_request: str, tools: List[Dict[str, Any]]) -> str:
-    tools_json = json.dumps(tools, indent=2)
-    return f"""You are a function-calling assistant.
-    Given a user request, pick the best function
-    and return ONLY a JSON object — no explanation, no markdown, no extra text.
+    def write_results(self, results: List[Dict[str, Any]]) -> None:
+        path = "/".join(self.output_path.split("/")[:-1])
 
-            Available functions:
-            {tools_json}
+        Path(path).mkdir(parents=True, exist_ok=True)
+        with open(self.output_path, 'w') as file:
+            json.dump(results, file, indent=4)
 
-            Output format (strictly):
-            {{"function": "<function_name>",
-            "parameters": {{<key>: <value>, ...}}}}
+class ToolRegistry(BaseModel):
+    tools: List[Dict[str, Any]] = []
 
-            User request: {user_request}
-            Response:
+    def build_prompt(self, user_request: str):
+        tools_json = json.dumps(self.tools, indent=2)
+        return f"""You are a function-calling assistant. \
+Given a user request, pick the best function \
+and return ONLY a JSON object — no explanation, no markdown, no extra text.
+
+        Available functions:
+{tools_json}
+
+        Output format (strictly): \
+{{"function": "<function_name>", \
+"parameters": {{<key>: <value>, ...}}}}
+
+        User request: {user_request}
+        Response:
         """
 
+    def get_valid_names(self) -> List[str]:
+        return [t["name"] for t in self.tools]
 
-def generate(model: Small_LLM_Model,
-             prompt: str, max_new_tokens: int = 200) -> Any:
-    # Encode prompt → list of ints
-    input_ids = model._tokenizer.encode(prompt, add_special_tokens=False)
-    eos_id = model._tokenizer.eos_token_id
+    def parse_tool_call(self, raw: str) -> Any:
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if not match:
+            raise ValueError(f"No JSON found in model output:\n{raw}")
+        return json.loads(match.group())
 
-    generated = []
-    for i in range(max_new_tokens):
-        logits = model.get_logits_from_input_ids(input_ids)
-
-        # pick the token with the highest logit
-        next_token = int(np.argmax(logits))
-
-        if next_token == eos_id:
-            break
-
-        input_ids.append(next_token)
-        generated.append(next_token)
-
-        # # Stop early if we see a closing brace → JSON is done
-        partial = model._tokenizer.decode(generated, skip_special_tokens=True)
-        if partial.count('{') > 0 and partial.count('}') >= partial.count('{'):
-            break
-        render_progress_bar(i)
-    sys.stdout.write("\033[?25h\r\033[K")
-
-    return model._tokenizer.decode(generated, skip_special_tokens=True)
+    def validate_call(self, raw: Dict[str, Any]) -> bool:
+        index = next((i for i, d in enumerate(self.tools) if d.get("name") == raw.get("function")), None)
+        if index is None:
+            return False
+        registerd_param = self.tools[index]["parameters"].keys()
+        response_param = raw["parameters"].keys()
+        if registerd_param != response_param:
+            return False
+        return True
 
 
-def parse_tool_call(raw: str) -> Any:
-    match = re.search(r'\{.*\}', raw, re.DOTALL)
-    if not match:
-        raise ValueError(f"No JSON found in model output:\n{raw}")
-    return json.loads(match.group())
+class ConstrainedGenerator(BaseModel):
+    def generate(self, model: Small_LLM_Model, prompt: str, valid_names: List[str], max_new_tokens: int = 200) -> Any:
+        input_ids = model._tokenizer.encode(prompt, add_special_tokens=False)
+        eos_id = model._tokenizer.eos_token_id
+
+        generated: List[int] = []
+        state = "START"
+        fn_name_so_far = ""
+        for i in range(max_new_tokens):
+            logits = model.get_logits_from_input_ids(input_ids)
+            if state == "STATE_4_FN_NAME":
+                for token_id in range(len(logits)):
+                    token_str = model._tokenizer.decode([token_id])
+                    condidate = fn_name_so_far + token_str
+
+                    is_prefix = any(n.startswith(condidate) for n in valid_names)
+                    is_exact = condidate in valid_names
+
+                    if not is_prefix and not is_exact:
+                        logits[token_id] = -float('inf')
+
+                if all(v == -float('inf') for v in logits):
+                    raise ValueError(f"❌ No function matched the request.")
+
+            next_token = int(np.argmax(logits))
+
+            if next_token == eos_id:
+                break
+
+            token_str = model._tokenizer.decode([next_token], skip_special_tokens=True)
+            input_ids.append(next_token)
+            generated.append(next_token)
+
+            partial = model._tokenizer.decode(generated, skip_special_tokens=True)
+            if partial.count('{') > 0 and partial.count('}') >= partial.count('{'):
+                break
+
+            # update state
+            if state == "START" and "{" in token_str:
+                state = "STATE_2_FN_KEY"
+
+            elif state == "STATE_2_FN_KEY" and "function" in token_str:
+                state = "STATE_3_OPEN_QUOTE"
+
+            elif state == "STATE_3_OPEN_QUOTE" and token_str == " \"":
+                state = "STATE_4_FN_NAME"
+                fn_name_so_far = ""
+
+            elif state == "STATE_4_FN_NAME":
+                fn_name_so_far += token_str
+                # check if we've completed a valid name
+                if fn_name_so_far in valid_names:
+                    chosen_fn = fn_name_so_far
+                    state     = "STATE_5_CLOSE_QUOTE"
+
+            elif state == "STATE_5_CLOSE_QUOTE" and '"' in token_str:
+                state = "STATE_6_PARAMS"
+        return model._tokenizer.decode(generated, skip_special_tokens=True)
 
 
-def run(model: Small_LLM_Model, user_request: str,
-        output_res: List[Dict[str, Any]],
-        tools: List[Dict[str, Any]]) -> bool:
-    prompt = build_prompt(user_request, tools)
-    raw = generate(model, prompt)
-    time.sleep(0.05)
 
-    call = parse_tool_call(raw)
-    fn_name = call["function"]
-    params = call["parameters"]
+class FunctionCaller(BaseModel):
+    registry: ToolRegistry
 
-    output_res.append(
-        {
-            "prompt": user_request,
-            "name": fn_name,
-            "parameters": params
-        }
-    )
-    return True
+    def run(self, prompt: str) -> Any:
+        constrained_gen = ConstrainedGenerator()
+        model = Small_LLM_Model()
 
-
-def main(args: argparse.Namespace) -> None:
-
-    if not args.functions_definition:
-        args.functions_definition = "functions_definition.json"
-    if not args.input_file:
-        args.input_file = "function_calling_tests.json"
-    if not args.output_file:
-        args.output_file = "function_calling_results.json"
-
-    output_path = Path("data/output")
-
-    prompts: List[str] = []
-    with open(f"data/input/{args.input_file}", 'r') as f:
-        content = json.load(f)
-        for prompt in content:
-            valid = TestCaseSchema(**prompt)
-            prompts.append(valid.prompt)
-
-    func_definition: List[FunctionDefSchema] = []
-    with open(f"data/input/{args.functions_definition}", 'r') as f:
-        content = json.load(f)
-        for funcdef in content:
-            valid = FunctionDefSchema(**funcdef)
-            func_definition.append(valid)
-
-    TOOLS = parse_functions_definitions(func_definition)
-
-    llm_model = Small_LLM_Model()
-
-    output_res: List[Dict[str, Any]] = []
-    passed_prompt: List[bool] = []
-    for p, i in zip(prompts, range(1, len(prompts) + 1)):
-        try:
-            sys.stdout.write("\033[2J\033[H\033[?25l")
-            sys.stdout.flush()
-            render_prompts_stat(i, prompts, passed_prompt)
-
-            print(f"\n{BG_BLUE} {RESET}{BG_CYAN}{FG_BLACK} Prompt {RESET} {p}")
-            try:
-                res = run(llm_model, p, output_res, TOOLS)
-            except KeyboardInterrupt:
-                res = False
-            passed_prompt.append(res)
-            time.sleep(0.08)
-        except KeyboardInterrupt:
-            pass
-
-    sys.stdout.write("\033[2J\033[H\033[?25l")
-    sys.stdout.flush()
-    render_prompts_stat(len(prompts) + 1, prompts, passed_prompt)
-
-    if any(passed_prompt):
-        output_path.mkdir(parents=True, exist_ok=True)
-        with open(f"data/output/{args.output_file}", 'w') as f:
-            json.dump(output_res, f, indent=4)
-        print(f"\n\n{BG_GREEN} {RESET} {FG_GREEN}",
-              f"Passed Prompts Are Seccessfully Saved{RESET}")
-        print(f"{BG_GREEN} {RESET} PATH: /data/ouput/{args.output_file}")
-        sys.stdout.write("\033[?25h")
-    else:
-        print(f"\n\n{BG_RED} {RESET}{FG_RED}",
-              f"All Prompts Failed Nothing to save{RESET}")
+        prompt = registry.build_prompt(prompt)
+        response = constrained_gen.generate(model, prompt, registry.get_valid_names())
+        json_response = registry.parse_tool_call(response)
+        if not registry.validate_call(json_response):
+            json_response = None
+        return json_response
 
 
 if __name__ == "__main__":
     render_exception = get_error_handler()
     try:
-        parser = argparse.ArgumentParser()
-        parser.add_argument('-f', '--functions_definition')
-        parser.add_argument('-i', '--input_file')
-        parser.add_argument('-o', '--output_file')
-        args = parser.parse_args()
+        config = Config.load()
+        registry = ToolRegistry(tools=config.tools)
+        caller = FunctionCaller(registry=registry)
 
-        main(args)
+        results: List[Dict[str, Any]] = []
+        passed_promts: List[bool] = []
+        for prompt in config.prompts:
+            raw = caller.run(prompt)
+            if raw:
+                results.append(raw)
+                passed_promts.append(True)
+            else:
+                passed_promts.append(False)
+            print(passed_promts)
+
+        config.write_results(results)
+    except SystemExit:
+        pass
     except (BaseException, KeyboardInterrupt) as e:
         render_exception(e)
         sys.exit(1)
